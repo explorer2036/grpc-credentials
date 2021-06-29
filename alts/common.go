@@ -1,4 +1,4 @@
-package internal
+package alts
 
 import (
 	"context"
@@ -28,4 +28,21 @@ type Handshaker interface {
 	// Close terminates the Handshaker. It should be called when the caller
 	// obtains the secure connection.
 	Close()
+}
+
+// ProtocolInfo provides information regarding the gRPC wire protocol version,
+// security protocol, security protocol version in use, server name, etc.
+type ProtocolInfo struct {
+	// ProtocolVersion is the gRPC wire protocol version.
+	ProtocolVersion string
+	// SecurityProtocol is the security protocol in use.
+	SecurityProtocol string
+	// SecurityVersion is the security protocol version.  It is a static version string from the
+	// credentials, not a value that reflects per-connection protocol negotiation.  To retrieve
+	// details about the credentials used for a connection, use the Peer's AuthInfo field instead.
+	//
+	// Deprecated: please use Peer.AuthInfo.
+	SecurityVersion string
+	// ServerName is the user-configured server name.
+	ServerName string
 }
