@@ -2,8 +2,19 @@ package conn
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
+
+const (
+	// GcmTagSize is the GCM tag size is the difference in length between
+	// plaintext and ciphertext. From crypto/cipher/gcm.go in Go crypto
+	// library.
+	GcmTagSize = 16
+)
+
+// ErrAuthorize occurs on authentication failure.
+var ErrAuthorize = errors.New("message authentication failed")
 
 // SliceForAppend takes a slice and a requested number of bytes. It returns a
 // slice with the contents of the given slice followed by that many bytes and a

@@ -21,16 +21,25 @@ const (
 	// maxPendingHandshakes represents the maximum number of concurrent handshakes.
 	maxPendingHandshakes = 100
 	// handshake header length
-	handshakeHeaderLen = 2
+	handshakeHeader = 2
 	// ED448PubKeySize - public key size of ed448
 	ED448PubKeySize = 56
 	// ED448PriKeySize - private key size of ed448
 	ED448PriKeySize = 144
-	// SecretKeySize - secret key size of aes256
-	AESSecretKeySize = 32
+	// record protocol name
+	rekeyRecordProtocol = "ALTSRP_GCM_AES128_REKEY"
 )
 
 var (
+	altsRecordFuncs = map[string]conn.ALTSRecordFunc{
+		// ALTS handshaker protocols.
+		rekeyRecordProtocol: func(s alts.Side, key []byte) (conn.ALTSRecordCrypto, error) {
+			return conn.NewAES128GCMRekey(s, key)
+		},
+	}
+	recordKeyLen = map[string]int{
+		rekeyRecordProtocol: 44,
+	}
 	// control number of concurrent created (but not closed) handshakers.
 	mu                   sync.Mutex
 	concurrentHandshakes = int64(0)
@@ -38,14 +47,12 @@ var (
 	errDropped = errors.New("maximum number of concurrent ALTS handshakes is reached")
 )
 
-// key exchange request
-type kexECDHRequest struct {
-	PubKey []byte // the client's public key
-}
-
-// key exchange response
-type kexECDHResponse struct {
-	PubKey []byte // the server's public key
+func init() {
+	for protocol, f := range altsRecordFuncs {
+		if err := conn.RegisterProtocol(protocol, f); err != nil {
+			panic(err)
+		}
+	}
 }
 
 func acquire() bool {
@@ -72,6 +79,16 @@ func release() {
 	mu.Unlock()
 }
 
+// key exchange request
+type kexECDHRequest struct {
+	PubKey []byte // the client's public key
+}
+
+// key exchange response
+type kexECDHResponse struct {
+	PubKey []byte // the server's public key
+}
+
 // ClientHandshakerOptions contains the client handshaker options that can
 // provided by the caller.
 type ClientHandshakerOptions struct {
@@ -94,6 +111,10 @@ func DefaultServerHandshakerOptions() *ServerHandshakerOptions {
 
 // altsHandshaker is used to complete a ALTS handshaking between client and server.
 type altsHandshaker struct {
+	// the record protocol
+	protocol string
+	// the record key
+	key []byte
 	// the connection to the peer.
 	conn net.Conn
 	// client handshake options.
@@ -107,6 +128,7 @@ type altsHandshaker struct {
 // NewClientHandshaker creates a ALTS handshaker
 func NewClientHandshaker(ctx context.Context, conn net.Conn, opts *ClientHandshakerOptions) (alts.Handshaker, error) {
 	return &altsHandshaker{
+		protocol:   rekeyRecordProtocol,
 		conn:       conn,
 		clientOpts: opts,
 		side:       alts.ClientSide,
@@ -116,6 +138,7 @@ func NewClientHandshaker(ctx context.Context, conn net.Conn, opts *ClientHandsha
 // NewServerHandshaker creates a ALTS handshaker
 func NewServerHandshaker(ctx context.Context, conn net.Conn, opts *ServerHandshakerOptions) (alts.Handshaker, error) {
 	return &altsHandshaker{
+		protocol:   rekeyRecordProtocol,
 		conn:       conn,
 		serverOpts: opts,
 		side:       alts.ServerSide,
@@ -124,7 +147,7 @@ func NewServerHandshaker(ctx context.Context, conn net.Conn, opts *ServerHandsha
 
 // read and decode the handshake record
 func (s *altsHandshaker) readHandshake(value interface{}) error {
-	hdr := make([]byte, handshakeHeaderLen)
+	hdr := make([]byte, handshakeHeader)
 	// read handshake header from connection
 	if _, err := s.conn.Read(hdr); err != nil {
 		return fmt.Errorf("read handshake header: %w", err)
@@ -160,10 +183,10 @@ func (s *altsHandshaker) writeHandshake(value interface{}) error {
 	}
 
 	m := buf.Len()
-	d := make([]byte, handshakeHeaderLen+m)
+	d := make([]byte, handshakeHeader+m)
 	d[0] = byte(m >> 8)
 	d[1] = byte(m)
-	copy(d[handshakeHeaderLen:], buf.Bytes())
+	copy(d[handshakeHeader:], buf.Bytes())
 
 	// write the handshake record
 	if _, err := s.conn.Write(d); err != nil {
@@ -172,24 +195,24 @@ func (s *altsHandshaker) writeHandshake(value interface{}) error {
 	return nil
 }
 
-func (s *altsHandshaker) doClientHandshake() ([]byte, error) {
+func (s *altsHandshaker) doClientHandshake() error {
 	curve := ed448.NewCurve()
 	// generate the private and public key for client
 	priv, pub, ok := curve.GenerateKeys()
 	if !ok {
-		return nil, errors.New("failed to generate keys")
+		return errors.New("failed to generate keys")
 	}
 
 	request := kexECDHRequest{PubKey: pub[:]}
 	// encode and write the client's handshake record
 	if err := s.writeHandshake(&request); err != nil {
-		return nil, fmt.Errorf("write handshake: %w", err)
+		return fmt.Errorf("write handshake: %w", err)
 	}
 
 	// read and decode the client's handshake record
 	var response kexECDHResponse
 	if err := s.readHandshake(&response); err != nil {
-		return nil, fmt.Errorf("read handshake: %w", err)
+		return fmt.Errorf("read handshake: %w", err)
 	}
 
 	var serverPubKey [ED448PubKeySize]byte
@@ -197,7 +220,10 @@ func (s *altsHandshaker) doClientHandshake() ([]byte, error) {
 	// compute the secret key for connection
 	secret := curve.ComputeSecret(priv, serverPubKey)
 
-	return secret[:AESSecretKeySize], nil
+	// update the record key
+	s.key = secret[:]
+
+	return nil
 }
 
 // ClientHandshake starts and completes a client ALTS handshaking. Once
@@ -213,41 +239,54 @@ func (s *altsHandshaker) ClientHandshake(ctx context.Context) (net.Conn, credent
 	}
 
 	// do the client handshake
-	secret, err := s.doClientHandshake()
-	if err != nil {
+	if err := s.doClientHandshake(); err != nil {
 		return nil, nil, fmt.Errorf("do client handshake: %w", err)
 	}
 	log.Print("client handshake is complete")
 
-	return conn.NewConn(s.side, s.conn, secret[:AESSecretKeySize]), authinfo.New(), nil
+	// The handshaker returns a 128 bytes key. It should be truncated based
+	// on the returned record protocol.
+	len, ok := recordKeyLen[s.protocol]
+	if !ok {
+		return nil, nil, fmt.Errorf("unknown resulted record protocol: %v", s.protocol)
+	}
+	// new a secure connection
+	sc, err := conn.NewConn(s.side, s.conn, s.protocol, s.key[:len])
+	if err != nil {
+		return nil, nil, fmt.Errorf("new secure conn: %w", err)
+	}
+
+	return sc, authinfo.New(), nil
 }
 
-func (s *altsHandshaker) doServerHandshake() ([]byte, error) {
+func (s *altsHandshaker) doServerHandshake() error {
 	// read and decode the client's handshake record
 	var request kexECDHRequest
 	if err := s.readHandshake(&request); err != nil {
-		return nil, fmt.Errorf("read handshake: %w", err)
+		return fmt.Errorf("read handshake: %w", err)
 	}
 
 	curve := ed448.NewCurve()
 	// generate the private key and public key for server
 	priv, pub, ok := curve.GenerateKeys()
 	if !ok {
-		return nil, errors.New("failed to generate keys")
+		return errors.New("failed to generate keys")
 	}
 
 	var clientPubKey [ED448PubKeySize]byte
 	copy(clientPubKey[:], request.PubKey)
 	// compute the secret key for connection
 	secret := curve.ComputeSecret(priv, clientPubKey)
+	// update the record key
+	s.key = secret[:]
 
 	response := kexECDHResponse{PubKey: pub[:]}
 	// encode and write the server's handshake record
 	if err := s.writeHandshake(&response); err != nil {
-		return nil, fmt.Errorf("write handshake: %w", err)
+		return fmt.Errorf("write handshake: %w", err)
 	}
 
-	return secret[:AESSecretKeySize], nil
+	return nil
 }
 
 // ServerHandshake starts and completes a server ALTS handshaking for GCP. Once
@@ -263,16 +302,26 @@ func (s *altsHandshaker) ServerHandshake(ctx context.Context) (net.Conn, credent
 	}
 
 	// do the server handshake
-	secret, err := s.doServerHandshake()
-	if err != nil {
+	if err := s.doServerHandshake(); err != nil {
 		return nil, nil, fmt.Errorf("do server handshake: %w", err)
 	}
 	log.Print("server handshake is complete")
 
-	return conn.NewConn(s.side, s.conn, secret), authinfo.New(), nil
+	// The handshaker returns a 128 bytes key. It should be truncated based
+	// on the returned record protocol.
+	len, ok := recordKeyLen[s.protocol]
+	if !ok {
+		return nil, nil, fmt.Errorf("unknown resulted record protocol: %v", s.protocol)
+	}
+	// new a secure connection
+	sc, err := conn.NewConn(s.side, s.conn, s.protocol, s.key[:len])
+	if err != nil {
+		return nil, nil, fmt.Errorf("new secure conn: %w", err)
+	}
+
+	return sc, authinfo.New(), nil
 }
 
 // Close terminates the Handshaker. It should be called when the caller obtains
 // the secure connection.
-func (s *altsHandshaker) Close() {
-}
+func (s *altsHandshaker) Close() {}

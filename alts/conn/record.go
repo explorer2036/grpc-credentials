@@ -61,6 +61,9 @@ func RegisterProtocol(protocol string, f ALTSRecordFunc) error {
 type conn struct {
 	net.Conn
 
+	// record crypto
+	crypto ALTSRecordCrypto
+
 	// buf holds data that has been read from the connection and decrypted,
 	// but has not yet been returned by Read.
 	buf          []byte
@@ -82,8 +85,17 @@ type conn struct {
 
 // NewConn creates a new secure channel instance given the other party role and
 // handshaking result.
-func NewConn(side alts.Side, c net.Conn, secret []byte) net.Conn {
-	overhead := frameLenFieldSize + frameTypeFieldSize
+func NewConn(side alts.Side, c net.Conn, protocol string, secret []byte) (net.Conn, error) {
+	newCrypto := protocols[protocol]
+	if newCrypto == nil {
+		return nil, fmt.Errorf("unknown next_protocol %q", protocol)
+	}
+	crypto, err := newCrypto(side, secret)
+	if err != nil {
+		return nil, fmt.Errorf("new crypto for %q: %v", protocol, err)
+	}
+
+	overhead := frameLenFieldSize + frameTypeFieldSize + crypto.EncryptionOverhead()
 	payloadLimit := altsRecordDefaultSize - overhead
 
 	// We pre-allocate protected to be of size
@@ -98,6 +110,7 @@ func NewConn(side alts.Side, c net.Conn, secret []byte) net.Conn {
 
 	altsConn := &conn{
 		Conn:         c,
+		crypto:       crypto,
 		payloadLimit: payloadLimit,
 		protected:    protected,
 		writeBuf:     make([]byte, altsWriteBufferInitialSize),
@@ -105,7 +118,7 @@ func NewConn(side alts.Side, c net.Conn, secret []byte) net.Conn {
 		overhead:     overhead,
 		secret:       secret,
 	}
-	return altsConn
+	return altsConn, nil
 }
 
 // Read reads and decrypts a frame from the underlying connection, and copies the
@@ -162,7 +175,7 @@ func (s *conn) Read(b []byte) (n int, err error) {
 		// ciphertext or use a separate destination buffer. For more info
 		// check: https://golang.org/pkg/crypto/cipher/#AEAD.
 		// decrypt the record payload
-		s.buf, err = aesDecrypt(ciphertext, s.secret)
+		s.buf, err = s.crypto.Decrypt(ciphertext[:0], ciphertext)
 		if err != nil {
 			return 0, err
 		}
@@ -216,11 +229,10 @@ func (s *conn) Write(b []byte) (n int, err error) {
 			binary.LittleEndian.PutUint32(msg, altsRecordMsgType)
 
 			// 2. Encrypt the payload and create a tag if any.
-			buf, err = aesEncrypt(buf, s.secret)
+			msg, err = s.crypto.Encrypt(msg[:frameTypeFieldSize], buf)
 			if err != nil {
 				return n, err
 			}
-			msg = append(msg[:frameTypeFieldSize], buf...)
 
 			// 3. Fill in the size field.
 			binary.LittleEndian.PutUint32(s.writeBuf[writeBufIndex:], uint32(len(msg)))
